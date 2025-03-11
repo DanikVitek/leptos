@@ -2,9 +2,11 @@ use convert_case::{Case, Casing};
 use proc_macro2::{Span, TokenStream};
 use proc_macro_error2::{abort, abort_call_site, proc_macro_error};
 use quote::{quote, ToTokens};
+use std::borrow::Cow;
 use syn::{
     parse::{Parse, ParseStream, Parser},
     punctuated::Punctuated,
+    spanned::Spanned,
     token::Comma,
     ExprClosure, Field, Fields, Generics, Ident, Index, Meta, Result, Token,
     Type, Variant, Visibility, WhereClause,
@@ -43,21 +45,9 @@ impl Parse for Model {
         let input = syn::DeriveInput::parse(input)?;
 
         let ty = match input.data {
-            syn::Data::Struct(s) => {
-                let fields = match s.fields {
-                    syn::Fields::Unit => {
-                        abort!(s.semi_token, "unit structs are not supported");
-                    }
-                    syn::Fields::Named(fields) => {
-                        fields.named.into_iter().collect::<Vec<_>>()
-                    }
-                    syn::Fields::Unnamed(fields) => {
-                        fields.unnamed.into_iter().collect::<Vec<_>>()
-                    }
-                };
-
-                ModelTy::Struct { fields }
-            }
+            syn::Data::Struct(s) => ModelTy::Struct {
+                fields: collect_struct_fields(s.fields, s.semi_token.span()),
+            },
             syn::Data::Enum(e) => ModelTy::Enum {
                 variants: e.variants.into_iter().collect(),
             },
@@ -84,7 +74,7 @@ enum SubfieldMode {
 }
 
 impl Parse for SubfieldMode {
-    fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
+    fn parse(input: ParseStream) -> Result<Self> {
         let mode: Ident = input.parse()?;
         if mode == "key" {
             let _col: Token!(:) = input.parse()?;
@@ -101,7 +91,7 @@ impl Parse for SubfieldMode {
 }
 
 impl ToTokens for Model {
-    fn to_tokens(&self, tokens: &mut proc_macro2::TokenStream) {
+    fn to_tokens(&self, tokens: &mut TokenStream) {
         let library_path = quote! { reactive_stores };
         let Model {
             vis,
@@ -146,6 +136,7 @@ impl ToTokens for Model {
                 #(#trait_fields)*
             }
 
+            #[automatically_derived]
             impl #generics_with_orig #trait_name <AnyStoreField> for AnyStoreField
             #where_with_orig
             {
@@ -185,8 +176,7 @@ impl ModelTy {
                                             {
                                                 Ok(modes) => Some(
                                                     modes
-                                                        .iter()
-                                                        .cloned()
+                                                        .into_iter()
                                                         .collect::<Vec<_>>(),
                                                 ),
                                                 Err(e) => abort!(list, e),
@@ -199,9 +189,8 @@ impl ModelTy {
                         .flatten();
 
                     (
-                        field_to_tokens(
+                        field_to_tokens::<false>(
                             idx,
-                            false,
                             modes.as_deref(),
                             library_path,
                             ident.as_ref(),
@@ -210,9 +199,8 @@ impl ModelTy {
                             name,
                             ty,
                         ),
-                        field_to_tokens(
+                        field_to_tokens::<true>(
                             idx,
-                            true,
                             modes.as_deref(),
                             library_path,
                             ident.as_ref(),
@@ -227,22 +215,24 @@ impl ModelTy {
             ModelTy::Enum { variants } => variants
                 .iter()
                 .map(|variant| {
-                    let Variant { ident, fields, .. } = variant;
+                    let Variant {
+                        ident: variant_name,
+                        fields,
+                        ..
+                    } = variant;
 
                     (
-                        variant_to_tokens(
-                            false,
+                        variant_to_tokens::<false>(
                             library_path,
-                            ident,
+                            variant_name,
                             generics,
                             any_store_field,
                             name,
                             fields,
                         ),
-                        variant_to_tokens(
-                            true,
+                        variant_to_tokens::<true>(
                             library_path,
-                            ident,
+                            variant_name,
                             generics,
                             any_store_field,
                             name,
@@ -256,44 +246,39 @@ impl ModelTy {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn field_to_tokens(
-    idx: usize,
-    include_body: bool,
+fn field_to_tokens<const INCLUDE_BODY: bool>(
+    field_idx: usize,
     modes: Option<&[SubfieldMode]>,
-    library_path: &proc_macro2::TokenStream,
-    orig_ident: Option<&Ident>,
+    library_path: &TokenStream,
+    field_name: Option<&Ident>,
     generics: &Generics,
     any_store_field: &Ident,
-    name: &Ident,
+    type_name: &Ident,
     ty: &Type,
-) -> proc_macro2::TokenStream {
-    let ident = if orig_ident.is_none() {
-        let idx = Ident::new(&format!("field{idx}"), Span::call_site());
-        quote! { #idx }
-    } else {
-        quote! { #orig_ident }
-    };
-    let locator = if orig_ident.is_none() {
-        let idx = Index::from(idx);
-        quote! { #idx }
-    } else {
-        quote! { #ident }
+) -> TokenStream {
+    let (fn_name, locator) = match field_name {
+        None => (
+            Cow::Owned(Ident::new(
+                &format!("field{field_idx}"),
+                Span::call_site(),
+            )),
+            Either::Right(Index::from(field_idx)),
+        ),
+        Some(field_name) => {
+            (Cow::Borrowed(field_name), Either::Left(field_name))
+        }
     };
 
     if let Some(modes) = modes {
-        if modes.len() == 1 {
-            let mode = &modes[0];
-            match mode {
+        if let [mode] = modes {
+            return match mode {
                 SubfieldMode::Keyed(keyed_by, key_ty) => {
-                    let signature = quote! {
-                        fn #ident(self) ->  #library_path::KeyedSubfield<#any_store_field, #name #generics, #key_ty, #ty>
-                    };
-                    return if include_body {
+                    if INCLUDE_BODY {
                         quote! {
-                            #signature {
+                            fn #fn_name(self) ->  #library_path::KeyedSubfield<#any_store_field, #type_name #generics, #key_ty, #ty> {
                                 #library_path::KeyedSubfield::new(
                                     self,
-                                    #idx.into(),
+                                    #field_idx.into(),
                                     #keyed_by,
                                     |prev| &prev.#locator,
                                     |prev| &mut prev.#locator,
@@ -301,14 +286,16 @@ fn field_to_tokens(
                             }
                         }
                     } else {
-                        quote! { #signature; }
-                    };
+                        quote! {
+                            fn #fn_name(self) ->  #library_path::KeyedSubfield<#any_store_field, #type_name #generics, #key_ty, #ty>;
+                        }
+                    }
                 }
-                SubfieldMode::Skip => return quote! {},
-            }
+                SubfieldMode::Skip => quote! {},
+            };
         } else {
             abort!(
-                orig_ident
+                field_name
                     .map(|ident| ident.span())
                     .unwrap_or_else(Span::call_site),
                 "multiple modes not currently supported"
@@ -317,12 +304,12 @@ fn field_to_tokens(
     }
 
     // default subfield
-    if include_body {
+    if INCLUDE_BODY {
         quote! {
-            fn #ident(self) ->  #library_path::Subfield<#any_store_field, #name #generics, #ty> {
+            fn #fn_name(self) ->  #library_path::Subfield<#any_store_field, #type_name #generics, #ty> {
                 #library_path::Subfield::new(
                     self,
-                    #idx.into(),
+                    #field_idx.into(),
                     |prev| &prev.#locator,
                     |prev| &mut prev.#locator,
                 )
@@ -330,70 +317,48 @@ fn field_to_tokens(
         }
     } else {
         quote! {
-            fn #ident(self) ->  #library_path::Subfield<#any_store_field, #name #generics, #ty>;
+            fn #fn_name(self) ->  #library_path::Subfield<#any_store_field, #type_name #generics, #ty>;
         }
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn variant_to_tokens(
-    include_body: bool,
-    library_path: &proc_macro2::TokenStream,
-    ident: &Ident,
+fn variant_to_tokens<const INCLUDE_BODY: bool>(
+    library_path: &TokenStream,
+    variant_name: &Ident,
     generics: &Generics,
     any_store_field: &Ident,
-    name: &Ident,
+    enum_name: &Ident,
     fields: &Fields,
-) -> proc_macro2::TokenStream {
+) -> TokenStream {
     // the method name will always be the snake_cased ident
-    let orig_ident = &ident;
-    let ident =
-        Ident::new(&ident.to_string().to_case(Case::Snake), ident.span());
+    let fn_name = Ident::new(
+        &variant_name.to_string().to_case(Case::Snake),
+        variant_name.span(),
+    );
 
     match fields {
         // For unit enum fields, we will just return a `bool` subfield, which is
         // true when this field matches
         Fields::Unit => {
             // default subfield
-            if include_body {
-                quote! {
-                    fn #ident(self) -> bool {
-                        match #library_path::StoreField::reader(&self) {
-                            Some(reader) => {
-                                #library_path::StoreField::track_field(&self);
-                                matches!(&*reader, #name::#orig_ident)
-                            },
-                            None => false
-                        }
-                    }
-                }
-            } else {
-                quote! {
-                    fn #ident(self) -> bool;
-                }
-            }
+            make_is_variant::<INCLUDE_BODY>(
+                enum_name,
+                &fn_name,
+                variant_name,
+                library_path,
+            )
         }
         // If an enum branch has named fields, we create N + 1 methods:
         // 1 `bool` subfield, which is true when this field matches
         // N `Option<T>` subfields for each of the named fields
         Fields::Named(fields) => {
-            let mut tokens = if include_body {
-                quote! {
-                    fn #ident(self) -> bool {
-                        match #library_path::StoreField::reader(&self) {
-                            Some(reader) => {
-                                #library_path::StoreField::track_field(&self);
-                                matches!(&*reader, #name::#orig_ident { .. })
-                            },
-                            None => false
-                        }
-                    }
-                }
-            } else {
-                quote! {
-                    fn #ident(self) -> bool;
-                }
-            };
+            let mut tokens = make_is_variant::<INCLUDE_BODY>(
+                enum_name,
+                &fn_name,
+                variant_name,
+                library_path,
+            );
 
             tokens.extend(fields
                 .named
@@ -402,46 +367,45 @@ fn variant_to_tokens(
                     let field_ident = field.ident.as_ref().unwrap();
                     let field_ty = &field.ty;
                     let combined_ident = Ident::new(
-                        &format!("{}_{}", ident, field_ident),
+                        &format!("{}_{}", fn_name, field_ident),
                         field_ident.span(),
                     );
 
+                    let signature = quote! {
+                        fn #combined_ident(self) -> Option<#library_path::Subfield<#any_store_field, #enum_name #generics, #field_ty>>
+                    };
                     // default subfield
-                    if include_body {
-                        quote! {
-                            fn #combined_ident(self) -> Option<#library_path::Subfield<#any_store_field, #name #generics, #field_ty>> {
-                                #library_path::StoreField::track_field(&self);
-                                let reader = #library_path::StoreField::reader(&self);
-                                let matches = reader
-                                    .map(|reader| matches!(&*reader, #name::#orig_ident { .. }))
-                                    .unwrap_or(false);
-                                if matches {
-                                    Some(#library_path::Subfield::new(
-                                        self,
-                                        0.into(),
-                                        |prev| {
-                                            match prev {
-                                                #name::#orig_ident { #field_ident, .. } => Some(#field_ident),
-                                                _ => None,
-                                            }
-                                            .expect("accessed an enum field that is no longer matched")
-                                        },
-                                        |prev| {
-                                            match prev {
-                                                #name::#orig_ident { #field_ident, .. } => Some(#field_ident),
-                                                _ => None,
-                                            }
-                                            .expect("accessed an enum field that is no longer matched")
-                                        },
-                                    ))
-                                } else {
-                                    None
-                                }
+                    if !INCLUDE_BODY {
+                        return quote! { #signature; };
+                    }
+                    quote! {
+                        #signature {
+                            #library_path::StoreField::track_field(&self);
+                            let reader = #library_path::StoreField::reader(&self);
+                            let matches = reader
+                                .map(|reader| matches!(&*reader, #enum_name::#variant_name { .. }))
+                                .unwrap_or(false);
+                            if !matches {
+                                return None;
                             }
-                        }
-                    } else {
-                        quote! {
-                            fn #combined_ident(self) -> Option<#library_path::Subfield<#any_store_field, #name #generics, #field_ty>>;
+                            Some(#library_path::Subfield::new(
+                                self,
+                                0.into(),
+                                |prev| {
+                                    match prev {
+                                        #enum_name::#variant_name { #field_ident, .. } => Some(#field_ident),
+                                        _ => None,
+                                    }
+                                    .expect("accessed an enum field that is no longer matched")
+                                },
+                                |prev| {
+                                    match prev {
+                                        #enum_name::#variant_name { #field_ident, .. } => Some(#field_ident),
+                                        _ => None,
+                                    }
+                                    .expect("accessed an enum field that is no longer matched")
+                                },
+                            ))
                         }
                     }
                 }));
@@ -452,23 +416,12 @@ fn variant_to_tokens(
         // 1 `bool` subfield, which is true when this field matches
         // N `Option<T>` subfields for each of the unnamed fields
         Fields::Unnamed(fields) => {
-            let mut tokens = if include_body {
-                quote! {
-                    fn #ident(self) -> bool {
-                        match #library_path::StoreField::reader(&self) {
-                            Some(reader) => {
-                                #library_path::StoreField::track_field(&self);
-                                matches!(&*reader, #name::#orig_ident { .. })
-                            },
-                            None => false
-                        }
-                    }
-                }
-            } else {
-                quote! {
-                    fn #ident(self) -> bool;
-                }
-            };
+            let mut tokens = make_is_variant::<INCLUDE_BODY>(
+                enum_name,
+                &fn_name,
+                variant_name,
+                library_path,
+            );
 
             let number_of_fields = fields.unnamed.len();
 
@@ -480,8 +433,8 @@ fn variant_to_tokens(
                     let field_ident = idx;
                     let field_ty = &field.ty;
                     let combined_ident = Ident::new(
-                        &format!("{}_{}", ident, field_ident),
-                        ident.span(),
+                        &format!("{}_{}", fn_name, field_ident),
+                        fn_name.span(),
                     );
 
                     let ignore_before = (0..idx).map(|_| quote! { _, });
@@ -489,47 +442,68 @@ fn variant_to_tokens(
                     let ignore_after = (idx..number_of_fields.saturating_sub(1)).map(|_| quote !{_, });
                     let ignore_after2 = ignore_after.clone();
 
+                    let signature = quote! {
+                        fn #combined_ident(self) -> Option<#library_path::Subfield<#any_store_field, #enum_name #generics, #field_ty>>
+                    };
                     // default subfield
-                    if include_body {
-                        quote! {
-                            fn #combined_ident(self) -> Option<#library_path::Subfield<#any_store_field, #name #generics, #field_ty>> {
-                                #library_path::StoreField::track_field(&self);
-                                let reader = #library_path::StoreField::reader(&self);
-                                let matches = reader
-                                    .map(|reader| matches!(&*reader, #name::#orig_ident(..)))
-                                    .unwrap_or(false);
-                                if matches {
-                                    Some(#library_path::Subfield::new(
-                                        self,
-                                        0.into(),
-                                        |prev| {
-                                            match prev {
-                                                #name::#orig_ident(#(#ignore_before)* this, #(#ignore_after)*) => Some(this),
-                                                _ => None,
-                                            }
-                                            .expect("accessed an enum field that is no longer matched")
-                                        },
-                                        |prev| {
-                                            match prev {
-                                                #name::#orig_ident(#(#ignore_before2)* this, #(#ignore_after2)*) => Some(this),
-                                                _ => None,
-                                            }
-                                            .expect("accessed an enum field that is no longer matched")
-                                        },
-                                    ))
-                                } else {
-                                    None
-                                }
+                    if !INCLUDE_BODY {
+                        return quote! { #signature; }
+                    }
+                    quote! {
+                        #signature {
+                            #library_path::StoreField::track_field(&self);
+                            let reader = #library_path::StoreField::reader(&self);
+                            let matches = reader
+                                .map(|reader| matches!(&*reader, #enum_name::#variant_name(..)))
+                                .unwrap_or(false);
+                            if !matches {
+                                return None;
                             }
-                        }
-                    } else {
-                        quote! {
-                            fn #combined_ident(self) -> Option<#library_path::Subfield<#any_store_field, #name #generics, #field_ty>>;
+                            Some(#library_path::Subfield::new(
+                                self,
+                                0.into(),
+                                |prev| {
+                                    match prev {
+                                        #enum_name::#variant_name(#(#ignore_before)* this, #(#ignore_after)*) => Some(this),
+                                        _ => None,
+                                    }
+                                    .expect("accessed an enum field that is no longer matched")
+                                },
+                                |prev| {
+                                    match prev {
+                                        #enum_name::#variant_name(#(#ignore_before2)* this, #(#ignore_after2)*) => Some(this),
+                                        _ => None,
+                                    }
+                                    .expect("accessed an enum field that is no longer matched")
+                                },
+                            ))
                         }
                     }
                 }));
 
             tokens
+        }
+    }
+}
+
+fn make_is_variant<const INCLUDE_BODY: bool>(
+    enum_name: &Ident,
+    fn_name: &Ident,
+    variant_name: &Ident,
+    library_path: &TokenStream,
+) -> TokenStream {
+    if !INCLUDE_BODY {
+        return quote! { fn #fn_name(self) -> bool; };
+    }
+    quote! {
+        fn #fn_name(self) -> bool {
+            match #library_path::StoreField::reader(&self) {
+                Some(reader) => {
+                    #library_path::StoreField::track_field(&self);
+                    matches!(&*reader, #enum_name::#variant_name)
+                },
+                None => false
+            }
         }
     }
 }
@@ -548,17 +522,7 @@ impl Parse for PatchModel {
             abort_call_site!("only structs can be used with `Patch`");
         };
 
-        let fields = match s.fields {
-            syn::Fields::Unit => {
-                abort!(s.semi_token, "unit structs are not supported");
-            }
-            syn::Fields::Named(fields) => {
-                fields.named.into_iter().collect::<Vec<_>>()
-            }
-            syn::Fields::Unnamed(fields) => {
-                fields.unnamed.into_iter().collect::<Vec<_>>()
-            }
-        };
+        let fields = collect_struct_fields(s.fields, s.semi_token.span());
 
         Ok(Self {
             name: input.ident,
@@ -568,8 +532,20 @@ impl Parse for PatchModel {
     }
 }
 
+fn collect_struct_fields<T>(fields: Fields, abort_span: Span) -> T
+where
+    T: FromIterator<Field>,
+{
+    match fields {
+        Fields::Unit => abort!(abort_span, "unit structs are not supported"),
+        Fields::Named(fields) => fields.named.into_iter(),
+        Fields::Unnamed(fields) => fields.unnamed.into_iter(),
+    }
+    .collect()
+}
+
 impl ToTokens for PatchModel {
-    fn to_tokens(&self, tokens: &mut proc_macro2::TokenStream) {
+    fn to_tokens(&self, tokens: &mut TokenStream) {
         let library_path = quote! { reactive_stores };
         let PatchModel {
             name,
@@ -595,6 +571,7 @@ impl ToTokens for PatchModel {
 
         // read access
         tokens.extend(quote! {
+            #[automatically_derived]
             impl #library_path::PatchField for #name #generics
             {
                 fn patch_field(
