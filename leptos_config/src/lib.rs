@@ -6,7 +6,12 @@ use crate::errors::LeptosConfigError;
 use config::{Case, Config, File, FileFormat};
 use regex::Regex;
 use std::{
-    env::VarError, fs, io, net::SocketAddr, path::Path, str::FromStr, sync::Arc,
+    env::VarError,
+    fs, io,
+    net::SocketAddr,
+    path::Path,
+    str::FromStr,
+    sync::{Arc, LazyLock},
 };
 use typed_builder::TypedBuilder;
 
@@ -371,18 +376,21 @@ impl TryFrom<String> for ReloadWSProtocol {
 pub fn get_config_from_str(
     text: &str,
 ) -> Result<LeptosOptions, LeptosConfigError> {
-    let re: Regex = Regex::new(r"(?m)^\[package.metadata.leptos\]").unwrap();
-    let re_workspace: Regex =
-        Regex::new(r"(?m)^\[\[workspace.metadata.leptos\]\]").unwrap();
+    static RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?m)^\[package.metadata.leptos\]").unwrap()
+    });
+    static RE_WORKSPACE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?m)^\[\[workspace.metadata.leptos\]\]").unwrap()
+    });
 
     let metadata_name;
     let start;
-    match re.find(text) {
+    match RE.find(text) {
         Some(found) => {
             metadata_name = "[package.metadata.leptos]";
             start = found.start();
         }
-        None => match re_workspace.find(text) {
+        None => match RE_WORKSPACE.find(text) {
             Some(found) => {
                 metadata_name = "[[workspace.metadata.leptos]]";
                 start = found.start();
