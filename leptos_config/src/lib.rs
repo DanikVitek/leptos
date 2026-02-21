@@ -6,7 +6,7 @@ use crate::errors::LeptosConfigError;
 use config::{Case, Config, File, FileFormat};
 use regex::Regex;
 use std::{
-    env::VarError, fs, net::SocketAddr, path::Path, str::FromStr, sync::Arc,
+    env::VarError, fs, io, net::SocketAddr, path::Path, str::FromStr, sync::Arc,
 };
 use typed_builder::TypedBuilder;
 
@@ -433,8 +433,10 @@ pub fn get_configuration(
 pub fn get_config_from_file<P: AsRef<Path>>(
     path: P,
 ) -> Result<ConfFile, LeptosConfigError> {
-    let text = fs::read_to_string(path)
-        .map_err(|_| LeptosConfigError::ConfigNotFound)?;
+    let text = fs::read_to_string(path).map_err(|e| match e.kind() {
+        io::ErrorKind::NotFound => LeptosConfigError::ConfigNotFound,
+        _ => LeptosConfigError::ConfigError(e.to_string()),
+    })?;
     let leptos_options = get_config_from_str(&text)?;
     Ok(ConfFile { leptos_options })
 }
