@@ -129,7 +129,7 @@ impl LeptosOptions {
     fn try_from_env() -> Result<Self, LeptosConfigError> {
         let output_name = env_w_default(
             "LEPTOS_OUTPUT_NAME",
-            std::option_env!("LEPTOS_OUTPUT_NAME",).unwrap_or_default(),
+            std::option_env!("LEPTOS_OUTPUT_NAME").unwrap_or_default(),
         )?;
         if output_name.is_empty() {
             eprintln!(
@@ -286,7 +286,7 @@ impl TryFrom<String> for Env {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
 struct EnvVisitor;
 
-impl<'de> serde::de::Visitor<'de> for EnvVisitor {
+impl serde::de::Visitor<'_> for EnvVisitor {
     type Value = Env;
 
     fn expecting(
@@ -397,7 +397,7 @@ pub fn get_config_from_str(
             }
             None => return Err(LeptosConfigError::ConfigSectionNotFound),
         },
-    };
+    }
 
     // so that serde error messages have right line number
     let newlines = text[..start].matches('\n').count();
